@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Coding4fun.Tpl.DataFlow.Shared</AssemblyName>
+    <RootNamespace>Coding4fun.Tpl.DataFlow.Shared</RootNamespace>
+  </PropertyGroup>
+
+</Project>
