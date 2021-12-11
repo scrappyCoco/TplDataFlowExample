@@ -28,20 +28,20 @@ CREATE TABLE #Logout (
         await InsertAsync(connectionString, dataTable, crateSignOutTable, "#Logout");
     }
 
-    private static async Task InsertAsync(string connectionString, DataTable dataTable, string tempTableDeclaration, string tempTableName)
+    private static async Task InsertAsync(string connectionString, DataTable dataTable, string tempTableDeclaration,
+        string tempTableName)
     {
+
         await using SqlConnection connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
-        
+
         await using SqlCommand createTableCommand = new SqlCommand(tempTableDeclaration, connection);
         createTableCommand.ExecuteNonQuery();
-        
-        using SqlBulkCopy sqlBulkCopy = new (connection);
+
+        using SqlBulkCopy sqlBulkCopy = new(connection);
         sqlBulkCopy.DestinationTableName = tempTableName;
         await sqlBulkCopy.WriteToServerAsync(dataTable);
-        
+
         dataTable.Clear();
-        
-        Console.WriteLine($"Rows has been inserted to DB {tempTableName}");
     }
 }

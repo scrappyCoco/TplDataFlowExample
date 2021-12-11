@@ -8,4 +8,8 @@
     <RootNamespace>Coding4fun.Tpl.DataFlow.Shared</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" Version="1.8.2" />
+  </ItemGroup>
+
 </Project>

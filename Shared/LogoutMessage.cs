@@ -1,7 +1,10 @@
-﻿namespace Coding4fun.Tpl.DataFlow.Shared;
+﻿using Confluent.Kafka;
 
-public class LogoutMessage
+namespace Coding4fun.Tpl.DataFlow.Shared;
+
+public class LogoutMessage: IKafkaEntity
 {
     public string SessionId { get; set; }
     public DateTime Time { get; set; }
+    public TopicPartitionOffset Offset { get; set; }
 }

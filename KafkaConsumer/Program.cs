@@ -1,26 +1,37 @@
 ﻿using System.Data;
-using System.Text.Json;
 using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using KafkaConsumer;
-using Nest;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+
+Thread.CurrentThread.Name = "Main Thread";
+CancellationTokenSource cancellationTokenSource = new();
+ILoggerFactory loggerFactory = new NullLoggerFactory();
+ILogger logger = loggerFactory.CreateLogger("Main");
 
 try
 {
-    const int maxMessageCount = 100;
+    #if DEBUG
+    const int batchSize = 100;
+    #else
+    const int batchSize = 10_000;
+    #endif
+    const int deserializeTheadCount = 2;
+    
     const string msConnectionString =
         "server=localhost;user id=sa;password=yourStrong(!)Password;Trusted_Connection=True";
-    
-    const string kafkaBrokerList = KafkaConfig.BrokerList;
-    const string kafkaLogIn = KafkaConfig.LogIn;
-    const string kafkaLogOut = KafkaConfig.LogOut;
 
-    const string esHost = "http://127.0.01:9200";
-    const string esIndex = "tpl";
-    
-    Thread.CurrentThread.Name = "Main Thread";
-    CancellationTokenSource cancellationTokenSource = new();
+    var kafkaConsumerConfig = new ConsumerConfig
+    {
+        BootstrapServers = KafkaConfig.BrokerList,
+        GroupId = "TestGroup",
+        AutoOffsetReset = AutoOffsetReset.Earliest,
+        EnableAutoCommit = false
+    };
+    var kafkaConsumerBuilder = new ConsumerBuilder<Ignore, string>(kafkaConsumerConfig);
 
     _ = Task.Run(() =>
     {
@@ -30,32 +41,16 @@ try
         cancellationTokenSource.Cancel();
     });
 
-    DataflowBlockOptions standardDataflowBlockOptions = new()
-    {
-        BoundedCapacity = 10_000,
-        CancellationToken = cancellationTokenSource.Token
-    };
+    DataFlowFactory dataFlowFactory = new DataFlowFactory(loggerFactory, cancellationTokenSource);
+    BufferBlock<ConsumeResult<Ignore, string>> kafkaReaderBlock = dataFlowFactory.CreateKafkaReaderBlock();
 
-    ExecutionDataflowBlockOptions CreateExecutionOptions(Action<ExecutionDataflowBlockOptions>? customizer = null)
-    {
-        ExecutionDataflowBlockOptions options = new ()
+    TransformBlock<ConsumeResult<Ignore, string>, IKafkaEntity?> deserializeMessageBlock =
+        dataFlowFactory.CreateDeserializerBlock(topic => topic switch
         {
-            BoundedCapacity = 10_000,
-            CancellationToken = cancellationTokenSource.Token,
-            MaxDegreeOfParallelism = 1
-        };
-        customizer?.Invoke(options);
-        return options;
-    }
-
-    BufferBlock<ConsumeResult<Ignore, string>> kafkaReaderBlock = new(standardDataflowBlockOptions);
-
-    TransformBlock<ConsumeResult<Ignore, string>, object?> deserializeMessageBlock = new(message =>
-    {
-        if (message.Topic == kafkaLogIn) return JsonSerializer.Deserialize<LoginMessage>(message.Message.Value);
-        if (message.Topic == kafkaLogOut) return JsonSerializer.Deserialize<LogoutMessage>(message.Message.Value);
-        return null;
-    }, CreateExecutionOptions(o => o.MaxDegreeOfParallelism = 2));
+            KafkaConfig.LogIn  => typeof(LoginMessage),
+            KafkaConfig.LogOut => typeof(LogoutMessage),
+            _                  => throw new InvalidOperationException($"Unable to find mapping for ${topic}")
+        }, options => options.MaxDegreeOfParallelism = deserializeTheadCount);
 
     DataTable loginDt = new();
     loginDt.Columns.Add(nameof(LoginMessage.Email), typeof(string));
@@ -66,33 +61,17 @@ try
     logoutDt.Columns.Add(nameof(LogoutMessage.Time), typeof(DateTime));
     logoutDt.Columns.Add(nameof(LogoutMessage.SessionId), typeof(string));
 
-    ActionBlock<object?> saveToMsSqlLoginMessageBlock = new(
-        async message =>
-        {
-            var loginMessage = (LoginMessage)message!;
-            loginDt.Rows.Add(loginMessage.Email, loginMessage.Time, loginMessage.SessionId);
-            if (loginDt.Rows.Count > maxMessageCount) await MsSqlConsumer.InsertLoginAsync(msConnectionString, loginDt);
-        }, CreateExecutionOptions()
-    );
+    ActionBlock<IKafkaEntity?> saveToMsSqlLoginMessageBlock =
+        dataFlowFactory.CreateSqlServerConsumerBlock<LoginMessage>(loginDt, batchSize,
+            () => MsSqlConsumer.InsertLoginAsync(msConnectionString, loginDt),
+            message => new object?[] { message.Email, message.Time, message.SessionId },
+            kafkaConsumerBuilder);
 
-    ActionBlock<object?> saveToMsSqlLogoutMessageBlock = new(
-        async message =>
-        {
-            var logoutMessage = (LogoutMessage)message!;
-            logoutDt.Rows.Add(logoutMessage.Time, logoutMessage.SessionId);
-            if (logoutDt.Rows.Count > maxMessageCount) await MsSqlConsumer.InsertLogoutAsync(msConnectionString, logoutDt);
-        }, CreateExecutionOptions()
-    );
-
-    var seSettings = new ConnectionSettings(new Uri(esHost)).DefaultIndex(esIndex);
-    var esClient = new ElasticClient(seSettings);
-    
-    ActionBlock<object?> saveToElasticSearchBlock = new(
-        async message =>
-        {
-            if (message is LoginMessage loginMessage) await esClient.IndexAsync(new IndexRequest<LoginMessage>(loginMessage, "login"));
-            else if (message is LogoutMessage logoutMessage) await esClient.IndexAsync(new IndexRequest<LogoutMessage>(logoutMessage, "logout"));
-        });
+    ActionBlock<IKafkaEntity?> saveToMsSqlLogoutMessageBlock =
+        dataFlowFactory.CreateSqlServerConsumerBlock<LogoutMessage>(logoutDt, batchSize,
+            () => MsSqlConsumer.InsertLogoutAsync(msConnectionString, logoutDt),
+            message => new object?[] { message.Time, message.SessionId },
+            kafkaConsumerBuilder);
 
     DataflowLinkOptions dataflowLinkOptions = new()
     {
@@ -100,28 +79,26 @@ try
     };
 
     kafkaReaderBlock.LinkTo(deserializeMessageBlock, dataflowLinkOptions);
-    
-    BroadcastBlock<object?> broadcastBlock = new (it => it, CreateExecutionOptions());
+
+    BroadcastBlock<IKafkaEntity?> broadcastBlock = dataFlowFactory.CreateBroadcastBlock();
     deserializeMessageBlock.LinkTo(broadcastBlock, dataflowLinkOptions);
-    
+
     broadcastBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions, message => message is LoginMessage);
     broadcastBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions, message => message is LogoutMessage);
-    broadcastBlock.LinkTo(saveToElasticSearchBlock, dataflowLinkOptions);
 
     Task kafkaReaderTask = KafkaReader.ReadMessagesAsync(
-        kafkaBrokerList,
+        kafkaConsumerBuilder,
         cancellationTokenSource.Token,
         kafkaReaderBlock,
-        kafkaLogIn,
-        kafkaLogOut);
+        KafkaConfig.LogIn,
+        KafkaConfig.LogOut);
 
     await Task.WhenAll(
         kafkaReaderTask,
         saveToMsSqlLoginMessageBlock.Completion,
-        saveToMsSqlLogoutMessageBlock.Completion,
-        saveToElasticSearchBlock.Completion);
+        saveToMsSqlLogoutMessageBlock.Completion);
 }
 catch (Exception exception)
 {
-    Console.Write(exception.ToString());
+    logger.LogCritical("{exception}", exception.Message);
 }
