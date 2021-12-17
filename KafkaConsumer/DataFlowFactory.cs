@@ -4,6 +4,7 @@ using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
+using Timer = System.Timers.Timer;
 
 namespace KafkaConsumer;
 
@@ -15,15 +16,20 @@ public class DataFlowFactory
     private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly DataflowBlockOptions _standardDataflowBlockOptions;
+    private readonly KafkaReader _kafkaReader;
     private readonly ILogger _deserializeLogger;
     private readonly ILogger _sqlServerConsumerLogger;
 
-    public DataFlowFactory(ILoggerFactory loggerFactory, CancellationTokenSource cancellationTokenSource)
+    public DataFlowFactory(
+        ILoggerFactory loggerFactory,
+        CancellationTokenSource cancellationTokenSource,
+        KafkaReader kafkaReader)
     {
         _loggerFactory = loggerFactory;
         _deserializeLogger = CreateLogger(nameof(CreateDeserializerBlock));
         _sqlServerConsumerLogger = CreateLogger(nameof(CreateSqlServerConsumerBlock));
         _cancellationTokenSource = cancellationTokenSource;
+        _kafkaReader = kafkaReader;
         _standardDataflowBlockOptions = new DataflowBlockOptions
         {
             BoundedCapacity = 10_000,
@@ -83,13 +89,32 @@ public class DataFlowFactory
         DataTable dataTable,
         int batchSize,
         Func<Task> flushBatchAsync,
-        Func<TEntity, object?[]> fillDataTable,
-        ConsumerBuilder<Ignore, string> kafkaConsumerBuilder)
+        Func<TEntity, object?[]> fillDataTable)
     where TEntity : class, IKafkaEntity
     {
         Dictionary<Partition, TopicPartitionOffset> offsets = new();
         string entityTypeName = typeof(TEntity).Name;
+
+        Timer timer = new Timer(TimeSpan.FromMinutes(10d).TotalMilliseconds);
+
+        async Task FlushBatchAsync()
+        {
+            timer.Stop();
+            await flushBatchAsync.Invoke();
+            _kafkaReader.CommitOffsets(offsets.Values);
+            if (_sqlServerConsumerLogger.IsEnabled(LogLevel.Debug))
+            {
+                _sqlServerConsumerLogger.LogDebug("{entityTypeName}: {batchSize} rows has been inserted, {offsets}",
+                    entityTypeName,
+                    batchSize,
+                    offsets.Values);
+            }
+            
+            timer.Start();
+        }
         
+        timer.Elapsed += async (_, _) => await FlushBatchAsync();
+
         return new ActionBlock<IKafkaEntity?>(async entity =>
         {
             try
@@ -97,18 +122,12 @@ public class DataFlowFactory
                 if (entity is not TEntity tEntity) return;
                 offsets[tEntity.Offset.Partition] = entity.Offset;
                 dataTable.Rows.Add(fillDataTable.Invoke(tEntity));
-                if (dataTable.Rows.Count > batchSize)
-                {
-                    await flushBatchAsync.Invoke();
-                    KafkaReader.CommitOffsets(kafkaConsumerBuilder, offsets.Values);
-                }
+                if (dataTable.Rows.Count >= batchSize) await FlushBatchAsync();
             }
             catch (Exception exception)
             {
-                _sqlServerConsumerLogger.LogError("{entityTypeName}, {exception}", entityTypeName, exception.Message);
+                _sqlServerConsumerLogger.LogError("{entityTypeName}: {exception}", entityTypeName, exception.Message);
             }
         }, CreateExecutionOptions());
     }
-    
-    public BroadcastBlock<IKafkaEntity?> CreateBroadcastBlock() => new(it => it, CreateExecutionOptions());
 }

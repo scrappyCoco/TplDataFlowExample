@@ -1,4 +1,4 @@
-﻿namespace Coding4fun.Tpl.DataFlow.Shared;
+﻿namespace Coding4fun.Tpl.DataFlow.KafkaProducer;
 
 public static class KafkaConfig
 {

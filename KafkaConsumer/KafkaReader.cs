@@ -1,39 +1,55 @@
 ﻿using System.Threading.Tasks.Dataflow;
 using Confluent.Kafka;
+using Microsoft.Extensions.Logging;
 
 namespace KafkaConsumer;
 
-public static class KafkaReader
+public class KafkaReader
 {
-    public static async Task ReadMessagesAsync(ConsumerBuilder<Ignore, string> consumerBuilder, CancellationToken cancellationToken,
-        ITargetBlock<ConsumeResult<Ignore, string>> targetBlock, params string[] topics) => await Task.Run(async () =>
+    private readonly IConsumer<Ignore, string> _kafkaConsumer;
+    private readonly CancellationToken _cancellationToken;
+    private readonly ILogger<KafkaReader> _logger;
+
+    public KafkaReader(
+        ConsumerBuilder<Ignore, string> consumerBuilder,
+        CancellationTokenSource cancellationTokenSource,
+        ILogger<KafkaReader> logger)
+    {
+        _kafkaConsumer = consumerBuilder.Build();
+        _cancellationToken = cancellationTokenSource.Token;
+        _logger = logger;
+    }
+    
+    public async Task ReadMessagesAsync(ITargetBlock<ConsumeResult<Ignore, string>> targetBlock, params string[] topics) => await Task.Run(async () =>
         {
             Thread.CurrentThread.Name = "Kafka Reader Thread";
 
             try
             {
-                using var consumer = consumerBuilder.Build();
-                consumer.Subscribe(topics);
-                while (!cancellationToken.IsCancellationRequested)
+                _kafkaConsumer.Subscribe(topics);
+                while (!_cancellationToken.IsCancellationRequested)
                 {
-                    ConsumeResult<Ignore, string> consumeResult = consumer.Consume(cancellationToken);
-                    await targetBlock.SendAsync(consumeResult, cancellationToken);
+                    ConsumeResult<Ignore, string> consumeResult = _kafkaConsumer.Consume(_cancellationToken);
+                    await targetBlock.SendAsync(consumeResult, _cancellationToken);
                 }
             }
             catch (OperationCanceledException)
             {
             }
-            catch (Exception e)
+            catch (Exception exception)
             {
-                Console.WriteLine(e);
+                _logger.LogError("{exception}", exception);
+            }
+            finally
+            {
+                _kafkaConsumer.Dispose();
             }
 
             targetBlock.Complete();
-        }, cancellationToken);
+        }, _cancellationToken);
 
-    public static void CommitOffsets(ConsumerBuilder<Ignore, string> consumerBuilder, IEnumerable<TopicPartitionOffset> offsets)
+    public void CommitOffsets(IEnumerable<TopicPartitionOffset> offsets)
     {
-        using var consumer = consumerBuilder.Build();
-        consumer.Commit(offsets);
+        _kafkaConsumer.Commit(offsets);
     }
 }

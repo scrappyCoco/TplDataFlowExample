@@ -3,35 +3,47 @@ using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using KafkaConsumer;
+using KafkaConsumer.Config;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
+using NLog.Extensions.Logging;
 
 
 Thread.CurrentThread.Name = "Main Thread";
 CancellationTokenSource cancellationTokenSource = new();
-ILoggerFactory loggerFactory = new NullLoggerFactory();
-ILogger logger = loggerFactory.CreateLogger("Main");
+ILogger? logger = null;
 
 try
 {
-    #if DEBUG
-    const int batchSize = 100;
-    #else
-    const int batchSize = 10_000;
-    #endif
-    const int deserializeTheadCount = 2;
-    
-    const string msConnectionString =
-        "server=localhost;user id=sa;password=yourStrong(!)Password;Trusted_Connection=True";
+    RootConfig config = new ConfigurationBuilder()
+        .AddJsonFile("appsettings.json")
+        .Build()
+        .Get<RootConfig>();
 
-    var kafkaConsumerConfig = new ConsumerConfig
+    ConsumerBuilder<Ignore, string> consumerBuilder = new (new ConsumerConfig
     {
-        BootstrapServers = KafkaConfig.BrokerList,
-        GroupId = "TestGroup",
+        BootstrapServers = config.Kafka.BrokerList,
+        GroupId = config.Kafka.GroupId,
         AutoOffsetReset = AutoOffsetReset.Earliest,
         EnableAutoCommit = false
-    };
-    var kafkaConsumerBuilder = new ConsumerBuilder<Ignore, string>(kafkaConsumerConfig);
+    });
+
+    await using var servicesProvider = new ServiceCollection()
+        .AddLogging(loggingBuilder =>
+        {
+            loggingBuilder.ClearProviders();
+            loggingBuilder.SetMinimumLevel(LogLevel.Debug);
+            loggingBuilder.AddNLog("NLog.config");
+        })
+        .AddSingleton(cancellationTokenSource)
+        .AddSingleton(consumerBuilder)
+        .AddSingleton<KafkaReader>()
+        .AddTransient<DataFlowFactory>()
+        .BuildServiceProvider();
+    
+    logger = servicesProvider.GetRequiredService<ILogger<Program>>();
+    var kafkaReader = servicesProvider.GetRequiredService<KafkaReader>();
 
     _ = Task.Run(() =>
     {
@@ -41,16 +53,15 @@ try
         cancellationTokenSource.Cancel();
     });
 
-    DataFlowFactory dataFlowFactory = new DataFlowFactory(loggerFactory, cancellationTokenSource);
+    DataFlowFactory dataFlowFactory = servicesProvider.GetRequiredService<DataFlowFactory>();
     BufferBlock<ConsumeResult<Ignore, string>> kafkaReaderBlock = dataFlowFactory.CreateKafkaReaderBlock();
 
     TransformBlock<ConsumeResult<Ignore, string>, IKafkaEntity?> deserializeMessageBlock =
-        dataFlowFactory.CreateDeserializerBlock(topic => topic switch
-        {
-            KafkaConfig.LogIn  => typeof(LoginMessage),
-            KafkaConfig.LogOut => typeof(LogoutMessage),
-            _                  => throw new InvalidOperationException($"Unable to find mapping for ${topic}")
-        }, options => options.MaxDegreeOfParallelism = deserializeTheadCount);
+        dataFlowFactory.CreateDeserializerBlock(topic =>
+                topic == config.Kafka.LoginTopicName ? typeof(LoginMessage) :
+                topic == config.Kafka.LogoutTopicName ? typeof(LogoutMessage) :
+                throw new InvalidOperationException($"Unable to find mapping for ${topic}"),
+            options => options.MaxDegreeOfParallelism = config.DeserializeThreadsCount);
 
     DataTable loginDt = new();
     loginDt.Columns.Add(nameof(LoginMessage.Email), typeof(string));
@@ -62,16 +73,14 @@ try
     logoutDt.Columns.Add(nameof(LogoutMessage.SessionId), typeof(string));
 
     ActionBlock<IKafkaEntity?> saveToMsSqlLoginMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock<LoginMessage>(loginDt, batchSize,
-            () => MsSqlConsumer.InsertLoginAsync(msConnectionString, loginDt),
-            message => new object?[] { message.Email, message.Time, message.SessionId },
-            kafkaConsumerBuilder);
+        dataFlowFactory.CreateSqlServerConsumerBlock<LoginMessage>(loginDt, config.MsSql.BatchSize,
+            () => MsSqlConsumer.InsertLoginAsync(config.MsSql.ConnectionString, loginDt),
+            message => new object?[] { message.Email, message.Time, message.SessionId });
 
     ActionBlock<IKafkaEntity?> saveToMsSqlLogoutMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock<LogoutMessage>(logoutDt, batchSize,
-            () => MsSqlConsumer.InsertLogoutAsync(msConnectionString, logoutDt),
-            message => new object?[] { message.Time, message.SessionId },
-            kafkaConsumerBuilder);
+        dataFlowFactory.CreateSqlServerConsumerBlock<LogoutMessage>(logoutDt, config.MsSql.BatchSize,
+            () => MsSqlConsumer.InsertLogoutAsync(config.MsSql.ConnectionString, logoutDt),
+            message => new object?[] { message.Time, message.SessionId });
 
     DataflowLinkOptions dataflowLinkOptions = new()
     {
@@ -80,18 +89,13 @@ try
 
     kafkaReaderBlock.LinkTo(deserializeMessageBlock, dataflowLinkOptions);
 
-    BroadcastBlock<IKafkaEntity?> broadcastBlock = dataFlowFactory.CreateBroadcastBlock();
-    deserializeMessageBlock.LinkTo(broadcastBlock, dataflowLinkOptions);
+    deserializeMessageBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions, message => message is LoginMessage);
+    deserializeMessageBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions, message => message is LogoutMessage);
 
-    broadcastBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions, message => message is LoginMessage);
-    broadcastBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions, message => message is LogoutMessage);
-
-    Task kafkaReaderTask = KafkaReader.ReadMessagesAsync(
-        kafkaConsumerBuilder,
-        cancellationTokenSource.Token,
+    Task kafkaReaderTask = kafkaReader.ReadMessagesAsync(
         kafkaReaderBlock,
-        KafkaConfig.LogIn,
-        KafkaConfig.LogOut);
+        config.Kafka.LoginTopicName,
+        config.Kafka.LogoutTopicName);
 
     await Task.WhenAll(
         kafkaReaderTask,
@@ -100,5 +104,5 @@ try
 }
 catch (Exception exception)
 {
-    logger.LogCritical("{exception}", exception.Message);
+    logger!.LogCritical("{exception}", exception.Message);
 }
