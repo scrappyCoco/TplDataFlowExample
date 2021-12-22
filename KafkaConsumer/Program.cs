@@ -4,6 +4,7 @@ using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using KafkaConsumer;
 using KafkaConsumer.Config;
+using KafkaConsumer.Db;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -72,15 +73,13 @@ try
     logoutDt.Columns.Add(nameof(LogoutMessage.Time), typeof(DateTime));
     logoutDt.Columns.Add(nameof(LogoutMessage.SessionId), typeof(string));
 
+    TimeSpan defaultTimeout = TimeSpan.FromMinutes(5d);
+    
     ActionBlock<IKafkaEntity?> saveToMsSqlLoginMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock<LoginMessage>(loginDt, config.MsSql.BatchSize,
-            () => MsSqlConsumer.InsertLoginAsync(config.MsSql.ConnectionString, loginDt),
-            message => new object?[] { message.Email, message.Time, message.SessionId });
+        dataFlowFactory.CreateSqlServerConsumerBlock(new MsLoginBatchHandler(config.MsSql.ConnectionString), defaultTimeout);
 
     ActionBlock<IKafkaEntity?> saveToMsSqlLogoutMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock<LogoutMessage>(logoutDt, config.MsSql.BatchSize,
-            () => MsSqlConsumer.InsertLogoutAsync(config.MsSql.ConnectionString, logoutDt),
-            message => new object?[] { message.Time, message.SessionId });
+        dataFlowFactory.CreateSqlServerConsumerBlock(new MsLogoutBatchHandler(config.MsSql.ConnectionString), defaultTimeout);
 
     DataflowLinkOptions dataflowLinkOptions = new()
     {

@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
+using KafkaConsumer.Db;
 using Microsoft.Extensions.Logging;
 using Timer = System.Timers.Timer;
 
@@ -86,34 +87,48 @@ public class DataFlowFactory
     }, CreateExecutionOptions(customizeOptions));
 
     public ActionBlock<IKafkaEntity?> CreateSqlServerConsumerBlock<TEntity>(
-        DataTable dataTable,
-        int batchSize,
-        Func<Task> flushBatchAsync,
-        Func<TEntity, object?[]> fillDataTable)
+        MsSqlBatchHandler<TEntity> batchHandler,
+        TimeSpan batchFlushTimeout)
     where TEntity : class, IKafkaEntity
     {
         Dictionary<Partition, TopicPartitionOffset> offsets = new();
         string entityTypeName = typeof(TEntity).Name;
+        SemaphoreSlim batchFlushSemaphoreSlim = new(1, 1); 
 
-        Timer timer = new Timer(TimeSpan.FromMinutes(10d).TotalMilliseconds);
+        Timer timer = new Timer(batchFlushTimeout.TotalMilliseconds);
 
         async Task FlushBatchAsync()
         {
+            await batchFlushSemaphoreSlim.WaitAsync();
             timer.Stop();
-            await flushBatchAsync.Invoke();
-            _kafkaReader.CommitOffsets(offsets.Values);
-            if (_sqlServerConsumerLogger.IsEnabled(LogLevel.Debug))
+            try
             {
-                _sqlServerConsumerLogger.LogDebug("{entityTypeName}: {batchSize} rows has been inserted, {offsets}",
+                await batchHandler.FlushBatchAsync();
+                
+                _sqlServerConsumerLogger.LogDebug("{entityTypeName}: {batchSize} rows has been inserted, {offsets}.",
                     entityTypeName,
-                    batchSize,
+                    batchHandler.BatchSize,
                     offsets.Values);
+                
+                _kafkaReader.CommitOffsets(offsets.Values);
             }
-            
-            timer.Start();
+            catch (Exception exception)
+            {
+                _sqlServerConsumerLogger.LogError("Unable to flush batch.", exception);
+                throw;
+            }
+            finally
+            {
+                batchFlushSemaphoreSlim.Release();
+                timer.Start();
+            }
         }
         
-        timer.Elapsed += async (_, _) => await FlushBatchAsync();
+        timer.Elapsed += async (_, _) =>
+        {
+            _sqlServerConsumerLogger.LogDebug("Flush batch by timeout.");
+            await FlushBatchAsync();
+        };
 
         return new ActionBlock<IKafkaEntity?>(async entity =>
         {
@@ -121,8 +136,13 @@ public class DataFlowFactory
             {
                 if (entity is not TEntity tEntity) return;
                 offsets[tEntity.Offset.Partition] = entity.Offset;
-                dataTable.Rows.Add(fillDataTable.Invoke(tEntity));
-                if (dataTable.Rows.Count >= batchSize) await FlushBatchAsync();
+                await batchHandler.AddEntityAsync(tEntity);
+                
+                if (batchHandler.IsBatchFull)
+                {
+                    _sqlServerConsumerLogger.LogDebug("Flush batch by size.");
+                    await FlushBatchAsync();
+                }
             }
             catch (Exception exception)
             {
