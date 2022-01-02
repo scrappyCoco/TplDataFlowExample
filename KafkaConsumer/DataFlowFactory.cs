@@ -24,7 +24,6 @@ public class DataFlowFactory
     private readonly ILoggerFactory _loggerFactory;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger _sqlServerConsumerLogger;
-    private readonly DataflowBlockOptions _standardDataflowBlockOptions;
 
     public DataFlowFactory(
         IServiceProvider serviceProvider,
@@ -41,11 +40,6 @@ public class DataFlowFactory
         _sqlServerConsumerLogger = CreateLogger(nameof(CreateSqlServerConsumerBlock));
         _cancellationTokenSource = cancellationTokenSource;
         _kafkaReader = kafkaReader;
-        _standardDataflowBlockOptions = new DataflowBlockOptions
-        {
-            BoundedCapacity = DefaultBufferSize,
-            CancellationToken = _cancellationTokenSource.Token
-        };
     }
 
     private ExecutionDataflowBlockOptions CreateExecutionOptions(
@@ -55,15 +49,12 @@ public class DataFlowFactory
         {
             BoundedCapacity = DefaultBufferSize,
             CancellationToken = _cancellationTokenSource.Token,
-            MaxDegreeOfParallelism = DefaultDegreeOfParallelism
+            MaxDegreeOfParallelism = DefaultDegreeOfParallelism,
+            SingleProducerConstrained = true,
+            EnsureOrdered = true
         };
         customize?.Invoke(options);
         return options;
-    }
-
-    public BufferBlock<ConsumeResult<Ignore, string>> CreateKafkaReaderBlock()
-    {
-        return new BufferBlock<ConsumeResult<Ignore, string>>(_standardDataflowBlockOptions);
     }
 
     public TransformBlock<ConsumeResult<Ignore, string>, KafkaEntity> CreateDeserializerBlock(
@@ -84,7 +75,7 @@ public class DataFlowFactory
         }
         catch (Exception exception)
         {
-            _deserializeLogger.LogError("Unable to deserialize: {errorMessage}, {topic}:{partition}:{offset}.",
+            _deserializeLogger.LogError("Unable to deserialize: {ErrorMessage} [{Topic}:{Partition}:{Offset}]",
                 exception.Message,
                 message.Topic,
                 message.Partition,
@@ -101,13 +92,13 @@ public class DataFlowFactory
     {
         MsSqlConfig msSqlConfig = _serviceProvider.GetService<MsSqlConfig>() ??
                                   throw new InvalidOperationException(
-                                      $"Unable to get instance of {nameof(MsSqlConfig)}.");
+                                      $"Unable to get instance of {nameof(MsSqlConfig)}");
+
+        string batchHandlerName = typeof(TBatchHandler).Name;
 
         TBatchHandler batchHandler = _serviceProvider.GetService<TBatchHandler>() ??
                                      throw new InvalidOperationException(
-                                         $"Unable to get instance of {typeof(TBatchHandler).Name}.");
-
-        string batchHandlerName = batchHandler.GetType().Name;
+                                         $"Unable to get instance of {batchHandlerName}");
 
         Dictionary<Partition, TopicPartitionOffset> offsets = new();
         SemaphoreSlim batchFlushSemaphoreSlim = new(1, 1);
@@ -125,7 +116,7 @@ public class DataFlowFactory
                 stopwatch.Stop();
 
                 _sqlServerConsumerLogger.LogDebug(
-                    "{batchHandlerName}: {insertedRowsCount} rows has been inserted, {offsets}, elapsed: {elapsed} ms.",
+                    "{BatchHandlerName}: {InsertedRowsCount} rows has been inserted, {Offsets}, {Elapsed} ms",
                     batchHandlerName,
                     insertedRowsCount,
                     offsets.Values,
@@ -136,7 +127,7 @@ public class DataFlowFactory
             }
             catch (Exception exception)
             {
-                _sqlServerConsumerLogger.LogError("Unable to flush batch. Exception: {errorMessage}.",
+                _sqlServerConsumerLogger.LogError("Unable to flush batch, {ErrorMessage}",
                     exception.Message);
                 throw;
             }
@@ -148,7 +139,7 @@ public class DataFlowFactory
 
         timer.Elapsed += async (_, _) =>
         {
-            _sqlServerConsumerLogger.LogDebug("Flush batch by timeout.");
+            _sqlServerConsumerLogger.LogDebug("Flush batch by timeout");
             await FlushBatchAsync();
         };
         timer.Start();
@@ -162,15 +153,15 @@ public class DataFlowFactory
 
                 if (batchHandler.IsBatchFull)
                 {
-                    _sqlServerConsumerLogger.LogDebug("Flush batch by size.");
+                    _sqlServerConsumerLogger.LogDebug("Flush batch by size");
                     await FlushBatchAsync();
                 }
             }
             catch (Exception exception)
             {
-                _sqlServerConsumerLogger.LogError("{batchHandlerName}: {errorMessage}", batchHandlerName,
+                _sqlServerConsumerLogger.LogError("{BatchHandlerName}: {ErrorMessage}", batchHandlerName,
                     exception.Message);
             }
-        }, CreateExecutionOptions());
+        }, CreateExecutionOptions(o => o.NameFormat = batchHandlerName + "_{1}"));
     }
 }

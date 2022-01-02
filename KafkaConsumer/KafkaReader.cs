@@ -38,7 +38,7 @@ public class KafkaReader
             }
             catch (Exception exception)
             {
-                _logger.LogError("{exception}", exception);
+                _logger.LogError("{Exception}", exception);
             }
             finally
             {

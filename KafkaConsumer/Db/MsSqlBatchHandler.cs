@@ -36,7 +36,7 @@ CREATE TABLE #KafkaMessage (
 
     protected MsSqlBatchHandler(MsSqlConfig config, DataTable[] dataTables)
     {
-        _connectionString = config.ConnectionString ?? "Unable to find connection string for MS SQL.";
+        _connectionString = config.ConnectionString;
         _batchSize = config.BatchSize ?? DefaultBatchSize;
         DataTables = dataTables;
         _insertedCount = 0;

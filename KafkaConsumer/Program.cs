@@ -1,4 +1,5 @@
-﻿using System.Threading.Tasks.Dataflow;
+﻿using System.ComponentModel.DataAnnotations;
+using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using KafkaConsumer;
@@ -19,6 +20,16 @@ try
         .AddJsonFile("appsettings.json")
         .Build()
         .Get<RootConfig>();
+
+    ValidationResult[] validationResults = config.Validate();
+    if (validationResults.Any())
+    {
+        foreach (ValidationResult validationResult in validationResults)
+        {
+            Console.Error.WriteLine(validationResult.ToString());
+            return;
+        }
+    }
 
     ConsumerBuilder<Ignore, string> consumerBuilder = new(new ConsumerConfig
     {
@@ -45,7 +56,27 @@ try
         .BuildServiceProvider();
 
     logger = servicesProvider.GetRequiredService<ILogger<Program>>();
-    var kafkaReader = servicesProvider.GetRequiredService<KafkaReader>();
+
+    var kafkaLogger = servicesProvider.GetRequiredService<ILoggerFactory>().CreateLogger("KafkaInternal");
+
+    consumerBuilder.SetPartitionsAssignedHandler((_, topics) =>
+    {
+        kafkaLogger.LogWarning("Partitions assigned: {Topics}",
+            string.Join(",", topics.Select(topic => $"[{topic.Topic}|{topic.Partition.Value}]"))
+        );
+    });
+
+    consumerBuilder.SetPartitionsRevokedHandler((_, topics) =>
+    {
+        kafkaLogger.LogWarning("Partitions revoked: {Topics}",
+            string.Join(",", topics.Select(topic => $"[{topic.Topic}|{topic.Partition.Value}]"))
+        );
+    });
+
+    consumerBuilder.SetErrorHandler((_, error) =>
+    {
+        kafkaLogger.LogWarning("Error occured: {ErrorMessage}", error.ToString());
+    });
 
     _ = Task.Run(() =>
     {
@@ -56,7 +87,6 @@ try
     });
 
     DataFlowFactory dataFlowFactory = servicesProvider.GetRequiredService<DataFlowFactory>();
-    BufferBlock<ConsumeResult<Ignore, string>> kafkaReaderBlock = dataFlowFactory.CreateKafkaReaderBlock();
 
     Type MapTopicNameToEntityType(string topic) =>
         topic == config.Kafka.LoginTopicName ? typeof(LoginMessage) :
@@ -78,15 +108,15 @@ try
         PropagateCompletion = true
     };
 
-    kafkaReaderBlock.LinkTo(deserializeMessageBlock, dataflowLinkOptions);
-
     deserializeMessageBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions,
         message => message.KafkaMessage.Topic == config.Kafka.LoginTopicName);
+
     deserializeMessageBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions,
         message => message.KafkaMessage.Topic == config.Kafka.LogoutTopicName);
 
+    var kafkaReader = servicesProvider.GetRequiredService<KafkaReader>();
     Task kafkaReaderTask = kafkaReader.ReadMessagesAsync(
-        kafkaReaderBlock,
+        deserializeMessageBlock,
         config.Kafka.LoginTopicName,
         config.Kafka.LogoutTopicName);
 
@@ -99,13 +129,10 @@ catch (Exception exception)
 {
     if (logger != null)
     {
-        logger.LogCritical("{errorMessage}", exception.Message);
+        logger.LogCritical("{ErrorMessage}", exception.Message);
     }
     else
     {
-        var foregroundColor = Console.ForegroundColor;
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine(exception.Message);
-        Console.ForegroundColor = foregroundColor;
+        Console.Error.WriteLine(exception.Message);
     }
 }
