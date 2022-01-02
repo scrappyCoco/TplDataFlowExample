@@ -1,5 +1,4 @@
-﻿using System.Data;
-using System.Threading.Tasks.Dataflow;
+﻿using System.Threading.Tasks.Dataflow;
 using Coding4fun.Tpl.DataFlow.Shared;
 using Confluent.Kafka;
 using KafkaConsumer;
@@ -9,7 +8,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using NLog.Extensions.Logging;
-
 
 Thread.CurrentThread.Name = "Main Thread";
 CancellationTokenSource cancellationTokenSource = new();
@@ -22,7 +20,7 @@ try
         .Build()
         .Get<RootConfig>();
 
-    ConsumerBuilder<Ignore, string> consumerBuilder = new (new ConsumerConfig
+    ConsumerBuilder<Ignore, string> consumerBuilder = new(new ConsumerConfig
     {
         BootstrapServers = config.Kafka.BrokerList,
         GroupId = config.Kafka.GroupId,
@@ -39,10 +37,13 @@ try
         })
         .AddSingleton(cancellationTokenSource)
         .AddSingleton(consumerBuilder)
+        .AddSingleton(_ => config.MsSql)
         .AddSingleton<KafkaReader>()
         .AddTransient<DataFlowFactory>()
+        .AddTransient<MsLoginBatchHandler>()
+        .AddTransient<MsLogoutBatchHandler>()
         .BuildServiceProvider();
-    
+
     logger = servicesProvider.GetRequiredService<ILogger<Program>>();
     var kafkaReader = servicesProvider.GetRequiredService<KafkaReader>();
 
@@ -57,29 +58,20 @@ try
     DataFlowFactory dataFlowFactory = servicesProvider.GetRequiredService<DataFlowFactory>();
     BufferBlock<ConsumeResult<Ignore, string>> kafkaReaderBlock = dataFlowFactory.CreateKafkaReaderBlock();
 
-    TransformBlock<ConsumeResult<Ignore, string>, IKafkaEntity?> deserializeMessageBlock =
-        dataFlowFactory.CreateDeserializerBlock(topic =>
-                topic == config.Kafka.LoginTopicName ? typeof(LoginMessage) :
-                topic == config.Kafka.LogoutTopicName ? typeof(LogoutMessage) :
-                throw new InvalidOperationException($"Unable to find mapping for ${topic}"),
+    Type MapTopicNameToEntityType(string topic) =>
+        topic == config.Kafka.LoginTopicName ? typeof(LoginMessage) :
+        topic == config.Kafka.LogoutTopicName ? typeof(LogoutMessage) :
+        throw new InvalidOperationException($"Unable to find mapping for ${topic}");
+
+    TransformBlock<ConsumeResult<Ignore, string>, KafkaEntity> deserializeMessageBlock =
+        dataFlowFactory.CreateDeserializerBlock(MapTopicNameToEntityType,
             options => options.MaxDegreeOfParallelism = config.DeserializeThreadsCount);
 
-    DataTable loginDt = new();
-    loginDt.Columns.Add(nameof(LoginMessage.Email), typeof(string));
-    loginDt.Columns.Add(nameof(LoginMessage.Time), typeof(DateTime));
-    loginDt.Columns.Add(nameof(LoginMessage.SessionId), typeof(string));
+    ActionBlock<KafkaEntity> saveToMsSqlLoginMessageBlock =
+        dataFlowFactory.CreateSqlServerConsumerBlock<MsLoginBatchHandler>();
 
-    DataTable logoutDt = new();
-    logoutDt.Columns.Add(nameof(LogoutMessage.Time), typeof(DateTime));
-    logoutDt.Columns.Add(nameof(LogoutMessage.SessionId), typeof(string));
-
-    TimeSpan defaultTimeout = TimeSpan.FromMinutes(5d);
-    
-    ActionBlock<IKafkaEntity?> saveToMsSqlLoginMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock(new MsLoginBatchHandler(config.MsSql.ConnectionString), defaultTimeout);
-
-    ActionBlock<IKafkaEntity?> saveToMsSqlLogoutMessageBlock =
-        dataFlowFactory.CreateSqlServerConsumerBlock(new MsLogoutBatchHandler(config.MsSql.ConnectionString), defaultTimeout);
+    ActionBlock<KafkaEntity> saveToMsSqlLogoutMessageBlock =
+        dataFlowFactory.CreateSqlServerConsumerBlock<MsLogoutBatchHandler>();
 
     DataflowLinkOptions dataflowLinkOptions = new()
     {
@@ -88,8 +80,10 @@ try
 
     kafkaReaderBlock.LinkTo(deserializeMessageBlock, dataflowLinkOptions);
 
-    deserializeMessageBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions, message => message is LoginMessage);
-    deserializeMessageBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions, message => message is LogoutMessage);
+    deserializeMessageBlock.LinkTo(saveToMsSqlLoginMessageBlock, dataflowLinkOptions,
+        message => message.KafkaMessage.Topic == config.Kafka.LoginTopicName);
+    deserializeMessageBlock.LinkTo(saveToMsSqlLogoutMessageBlock, dataflowLinkOptions,
+        message => message.KafkaMessage.Topic == config.Kafka.LogoutTopicName);
 
     Task kafkaReaderTask = kafkaReader.ReadMessagesAsync(
         kafkaReaderBlock,
@@ -103,5 +97,15 @@ try
 }
 catch (Exception exception)
 {
-    logger!.LogCritical("{exception}", exception.Message);
+    if (logger != null)
+    {
+        logger.LogCritical("{errorMessage}", exception.Message);
+    }
+    else
+    {
+        var foregroundColor = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine(exception.Message);
+        Console.ForegroundColor = foregroundColor;
+    }
 }

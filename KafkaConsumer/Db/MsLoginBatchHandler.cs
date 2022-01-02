@@ -1,13 +1,15 @@
-﻿using Coding4fun.Tpl.DataFlow.Shared;
+﻿using System.Data;
+using Coding4fun.Tpl.DataFlow.Shared;
+using KafkaConsumer.Config;
 
 namespace KafkaConsumer.Db;
 
-public class MsLoginBatchHandler: MsSqlBatchHandler<LoginMessage>
+public class MsLoginBatchHandler : MsSqlBatchHandler
 {
+    private readonly DataTable _logoutDt;
+
     /// <inheritdoc />
-    public MsLoginBatchHandler(string connectionString) : base(connectionString)
-    {
-    }
+    public MsLoginBatchHandler(MsSqlConfig config) : base(config, CreateDataTables()) => _logoutDt = DataTables[0];
 
     /// <inheritdoc />
     protected override string TempTableDeclaration => @"
@@ -18,11 +20,21 @@ CREATE TABLE #Login (
 );";
 
     /// <inheritdoc />
-    protected override string TempTableName => "#Login";
+    protected override string ProcedureName => "dbo.InsertLogin";
+
+    private static DataTable[] CreateDataTables()
+    {
+        DataTable dataTable = new DataTable("#Login");
+        dataTable.Columns.Add(nameof(LoginMessage.Email), typeof(string));
+        dataTable.Columns.Add(nameof(LoginMessage.Time), typeof(DateTime));
+        dataTable.Columns.Add(nameof(LoginMessage.SessionId), typeof(string));
+        return new[] { dataTable };
+    }
 
     /// <inheritdoc />
-    protected override void AddEntityInternal(LoginMessage entity)
+    protected override void AddEntityInternal(object entity)
     {
-        DataTable.Rows.Add(entity.Email, entity.Time, entity.SessionId);
+        var login = (LoginMessage)entity;
+        _logoutDt.Rows.Add(login.Email, login.Time, login.SessionId);
     }
 }

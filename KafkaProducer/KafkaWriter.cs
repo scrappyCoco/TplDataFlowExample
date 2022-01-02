@@ -15,8 +15,16 @@ public static class KafkaWriter
             {
                 BootstrapServers = brokerList
             }).Build();
-        
-            await adminClient.DeleteTopicsAsync(topicNames, new DeleteTopicsOptions());
+
+            try
+            {
+                await adminClient.DeleteTopicsAsync(topicNames, new DeleteTopicsOptions());
+            }
+            catch
+            {
+                // ignored
+            }
+
             await adminClient.CreateTopicsAsync(topicNames.Select(topicName => new TopicSpecification
             {
                 Name = topicName
@@ -27,21 +35,23 @@ public static class KafkaWriter
             Console.WriteLine(exception);
         }
     }
-    
+
     public static async Task WriteLoginAsync(string brokerList, string loginTopic, CancellationToken cancellationToken)
     {
         await WriteAsync(brokerList, loginTopic, cancellationToken, GetLoginMessages(cancellationToken));
     }
-    
-    public static async Task WriteLogoutAsync(string brokerList, string logoutTopic, CancellationToken cancellationToken)
+
+    public static async Task WriteLogoutAsync(string brokerList, string logoutTopic,
+        CancellationToken cancellationToken)
     {
         await WriteAsync(brokerList, logoutTopic, cancellationToken, GetLogoutMessages(cancellationToken));
     }
 
-    private static async Task WriteAsync<T>(string brokerList, string topicName, CancellationToken cancellationToken, IEnumerable<T> enumerable)
+    private static async Task WriteAsync<T>(string brokerList, string topicName, CancellationToken cancellationToken,
+        IEnumerable<T> enumerable)
     {
         Thread.CurrentThread.Name = $"Producer {topicName} Thread";
-        
+
         var config = new ProducerConfig
         {
             BootstrapServers = brokerList,
@@ -68,7 +78,6 @@ public static class KafkaWriter
         }
         catch (OperationCanceledException)
         {
-
         }
         catch (ProduceException<Null, string> exception)
         {
